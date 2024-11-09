@@ -29,6 +29,7 @@ import org.apache.kafka.common.TopicPartition;
 public class YourPartitioner implements Partitioner {
   private final ConcurrentHashMap<Integer, Long> partitionLoad = new ConcurrentHashMap<>();
   private final Map<String, Long> brokerLoad = new ConcurrentHashMap<>();
+  private final Map<String, Integer> brokerLeaderCount = new ConcurrentHashMap<>();
   private final Random random = new Random();
   private int previousPartition = -1;
 
@@ -41,22 +42,23 @@ public class YourPartitioner implements Partitioner {
     List<PartitionInfo> partitions = cluster.availablePartitionsForTopic(topic);
     int numPartitions = partitions.size();
 
-    // 只在分區數量有變化時更新 broker 負載
     if (numPartitions != partitionLoad.size()) {
       partitions.forEach(p -> partitionLoad.putIfAbsent(p.partition(), 0L));
       updateBrokerLoad(partitions, cluster);
+      updateBrokerLeaderCount(partitions);
     }
 
-    int targetPartition = selectPartition(partitions, cluster);
+    int targetPartition = selectPartition(partitions);
     long messageSize = valueBytes == null ? 0 : valueBytes.length;
 
-    // 只更新實際寫入的分區負載
+    // 更新目標分區負載
     partitionLoad.merge(targetPartition, messageSize, Long::sum);
 
-    // 更新該訊息對應 broker 的負載
+    // 更新 broker 負載和 leader 計數
     String leaderBrokerId =
         cluster.leaderFor(new TopicPartition(topic, targetPartition)).idString();
     brokerLoad.merge(leaderBrokerId, messageSize, Long::sum);
+    brokerLeaderCount.merge(leaderBrokerId, 1, Integer::sum);
 
     return targetPartition;
   }
@@ -73,6 +75,15 @@ public class YourPartitioner implements Partitioner {
         });
   }
 
+  private void updateBrokerLeaderCount(List<PartitionInfo> partitions) {
+    brokerLeaderCount.clear();
+    partitions.forEach(
+        partition -> {
+          String leaderId = partition.leader().idString();
+          brokerLeaderCount.merge(leaderId, 1, Integer::sum);
+        });
+  }
+
   private double calculateAAD() {
     double mean = partitionLoad.values().stream().mapToLong(Long::longValue).average().orElse(0.0);
     return partitionLoad.values().stream()
@@ -81,20 +92,16 @@ public class YourPartitioner implements Partitioner {
         .orElse(0.0);
   }
 
-  private int selectPartition(List<PartitionInfo> partitions, Cluster cluster) {
+  private int selectPartition(List<PartitionInfo> partitions) {
     double aad = calculateAAD();
 
     return partitions.stream()
         .filter(p -> partitionLoad.getOrDefault(p.partition(), 0L) < aad)
         .filter(
             p -> {
-              for (Node replica : p.replicas()) {
-                String brokerId = cluster.nodeById(replica.id()).idString();
-                if (brokerLoad.getOrDefault(brokerId, 0L) >= getBrokerLoadThreshold()) {
-                  return false;
-                }
-              }
-              return true;
+              String leaderId = p.leader().idString();
+              return brokerLoad.getOrDefault(leaderId, 0L) < getBrokerLoadThreshold()
+                  && brokerLeaderCount.getOrDefault(leaderId, 0) < getMaxLeaderCount();
             })
         .findFirst()
         .map(PartitionInfo::partition)
@@ -104,6 +111,11 @@ public class YourPartitioner implements Partitioner {
   private long getBrokerLoadThreshold() {
     // 設定 broker 的負載門檻，例如設定為 2 GB
     return 2L * 1024 * 1024 * 1024; // 2 GB
+  }
+
+  private int getMaxLeaderCount() {
+    // 設定單一 broker 最大的 leader 分區數
+    return 2; // 例如每個 broker 最多有 2 個 leader
   }
 
   private int getRandomPartition() {
