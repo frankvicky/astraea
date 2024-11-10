@@ -16,22 +16,29 @@
  */
 package org.astraea.common.partitioner;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Random;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.PriorityQueue;
+import java.util.Set;
 import org.apache.kafka.clients.producer.Partitioner;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.PartitionInfo;
-import org.apache.kafka.common.TopicPartition;
 
 public class YourPartitioner implements Partitioner {
-  private final ConcurrentHashMap<Integer, Long> partitionLoad = new ConcurrentHashMap<>();
-  private final Map<String, Long> brokerLoad = new ConcurrentHashMap<>();
-  private final Map<String, Integer> brokerLeaderCount = new ConcurrentHashMap<>();
-  private final Random random = new Random();
-  private int previousPartition = -1;
+
+  private final Set<Integer> nodes = new HashSet<>();
+  private final PriorityQueue<BrokerUsage> brokerUsageQueue =
+      new PriorityQueue<>(Comparator.comparingLong(b -> b.usage));
+  private final Map<Integer, List<PartitionInfo>> brokerToPartitions = new HashMap<>();
+  private Iterator<Integer> roundRobinIterator; // 用於輪詢初始化
+
+  private long maxUsageThreshold = 2L * 1024 * 1024 * 1024; // 初始負載門檻，2 GB
 
   @Override
   public void configure(Map<String, ?> configs) {}
@@ -39,92 +46,105 @@ public class YourPartitioner implements Partitioner {
   @Override
   public int partition(
       String topic, Object key, byte[] keyBytes, Object value, byte[] valueBytes, Cluster cluster) {
-    List<PartitionInfo> partitions = cluster.availablePartitionsForTopic(topic);
-    int numPartitions = partitions.size();
 
-    if (numPartitions != partitionLoad.size()) {
-      partitions.forEach(p -> partitionLoad.putIfAbsent(p.partition(), 0L));
-      updateBrokerLoad(partitions, cluster);
-      updateBrokerLeaderCount(partitions);
+    if (brokerUsageQueue.isEmpty() || nodes.size() != cluster.nodes().size()) {
+      initializeBrokerUsage(cluster);
+      assignPartitionsToBrokers(cluster.availablePartitionsForTopic(topic));
+      initializeRoundRobinIterator();
     }
 
-    int targetPartition = selectPartition(partitions);
-    long messageSize = valueBytes == null ? 0 : valueBytes.length;
-
-    // 更新目標分區負載
-    partitionLoad.merge(targetPartition, messageSize, Long::sum);
-
-    // 更新 broker 負載和 leader 計數
-    String leaderBrokerId =
-        cluster.leaderFor(new TopicPartition(topic, targetPartition)).idString();
-    brokerLoad.merge(leaderBrokerId, messageSize, Long::sum);
-    brokerLeaderCount.merge(leaderBrokerId, 1, Integer::sum);
-
-    return targetPartition;
+    return selectPartitionForBroker(valueBytes);
   }
 
-  private void updateBrokerLoad(List<PartitionInfo> partitions, Cluster cluster) {
-    brokerLoad.clear();
-    partitions.forEach(
-        partition -> {
-          long partitionSize = partitionLoad.getOrDefault(partition.partition(), 0L);
-          for (Node replica : partition.replicas()) {
-            String brokerId = cluster.nodeById(replica.id()).idString();
-            brokerLoad.merge(brokerId, partitionSize, Long::sum);
-          }
-        });
+  private void initializeRoundRobinIterator() {
+    roundRobinIterator = nodes.iterator();
   }
 
-  private void updateBrokerLeaderCount(List<PartitionInfo> partitions) {
-    brokerLeaderCount.clear();
-    partitions.forEach(
-        partition -> {
-          String leaderId = partition.leader().idString();
-          brokerLeaderCount.merge(leaderId, 1, Integer::sum);
-        });
+  private void assignPartitionsToBrokers(List<PartitionInfo> partitions) {
+    brokerToPartitions.values().forEach(List::clear);
+
+    for (PartitionInfo partitionInfo : partitions) {
+      int brokerId = getNextBrokerInRoundRobin();
+      brokerToPartitions.get(brokerId).add(partitionInfo);
+    }
   }
 
-  private double calculateAAD() {
-    double mean = partitionLoad.values().stream().mapToLong(Long::longValue).average().orElse(0.0);
-    return partitionLoad.values().stream()
-        .mapToDouble(load -> Math.abs(load - mean))
-        .average()
-        .orElse(0.0);
+  private int getNextBrokerInRoundRobin() {
+    if (!roundRobinIterator.hasNext()) {
+      initializeRoundRobinIterator();
+    }
+    return roundRobinIterator.next();
   }
 
-  private int selectPartition(List<PartitionInfo> partitions) {
-    double aad = calculateAAD();
+  private int selectPartitionForBroker(byte[] valueBytes) {
+    PriorityQueue<BrokerUsage> usageQueueCopy = new PriorityQueue<>(brokerUsageQueue);
+    long dataSize = calculateDataSize(valueBytes);
 
-    return partitions.stream()
-        .filter(p -> partitionLoad.getOrDefault(p.partition(), 0L) < aad)
-        .filter(
-            p -> {
-              String leaderId = p.leader().idString();
-              return brokerLoad.getOrDefault(leaderId, 0L) < getBrokerLoadThreshold()
-                  && brokerLeaderCount.getOrDefault(leaderId, 0) < getMaxLeaderCount();
-            })
-        .findFirst()
-        .map(PartitionInfo::partition)
-        .orElseGet(this::getRandomPartition);
+    while (!usageQueueCopy.isEmpty()) {
+      BrokerUsage leastLoadedBroker = usageQueueCopy.poll();
+      int brokerId = leastLoadedBroker.brokerId;
+      List<PartitionInfo> assignedPartitions = brokerToPartitions.get(brokerId);
+
+      if (!assignedPartitions.isEmpty() && leastLoadedBroker.usage + dataSize < maxUsageThreshold) {
+        PartitionInfo selectedPartition = assignedPartitions.remove(0);
+        updateBrokerUsage(brokerId, dataSize);
+        return selectedPartition.partition();
+      }
+    }
+
+    adjustThreshold(); // 動態調整門檻
+    return getFallbackPartition(); // 使用回退分區
   }
 
-  private long getBrokerLoadThreshold() {
-    // 設定 broker 的負載門檻，例如設定為 2 GB
-    return 2L * 1024 * 1024 * 1024; // 2 GB
+  private int getFallbackPartition() {
+    for (List<PartitionInfo> partitions : brokerToPartitions.values()) {
+      if (!partitions.isEmpty()) {
+        return partitions.get(0).partition();
+      }
+    }
+    return 0;
   }
 
-  private int getMaxLeaderCount() {
-    // 設定單一 broker 最大的 leader 分區數
-    return 2; // 例如每個 broker 最多有 2 個 leader
+  private void updateBrokerUsage(int brokerId, long dataSize) {
+    brokerUsageQueue.removeIf(b -> b.brokerId == brokerId);
+    brokerUsageQueue.add(new BrokerUsage(brokerId, dataSize));
   }
 
-  private int getRandomPartition() {
-    int newPartition;
-    do {
-      newPartition = random.nextInt(partitionLoad.size());
-    } while (newPartition == previousPartition);
-    previousPartition = newPartition;
-    return newPartition;
+  private void initializeBrokerUsage(Cluster cluster) {
+    brokerUsageQueue.clear();
+    nodes.clear();
+    brokerToPartitions.clear();
+    for (Node node : cluster.nodes()) {
+      brokerUsageQueue.add(new BrokerUsage(node.id(), 0L));
+      brokerToPartitions.put(node.id(), new ArrayList<>());
+      nodes.add(node.id());
+    }
+  }
+
+  private long calculateDataSize(byte[] data) {
+    return data == null ? 0L : data.length;
+  }
+
+  private void adjustThreshold() {
+    BrokerUsage maxLoadBroker = brokerUsageQueue.peek();
+    if (maxLoadBroker != null) {
+      if (maxLoadBroker.usage > maxUsageThreshold * 0.8) {
+        maxUsageThreshold += 256 * 1024 * 1024; // 增加 256 MB
+      } else if (maxLoadBroker.usage < maxUsageThreshold * 0.5) {
+        maxUsageThreshold =
+            Math.max(2L * 1024 * 1024 * 1024, maxUsageThreshold - 256 * 1024 * 1024); // 降低並設下限
+      }
+    }
+  }
+
+  private static class BrokerUsage {
+    int brokerId;
+    long usage;
+
+    BrokerUsage(int brokerId, long usage) {
+      this.brokerId = brokerId;
+      this.usage = usage;
+    }
   }
 
   @Override
