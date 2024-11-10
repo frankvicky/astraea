@@ -17,134 +17,80 @@
 package org.astraea.common.partitioner;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.PriorityQueue;
-import java.util.Set;
+import java.util.Random;
+import java.util.concurrent.ConcurrentHashMap;
 import org.apache.kafka.clients.producer.Partitioner;
 import org.apache.kafka.common.Cluster;
-import org.apache.kafka.common.Node;
 import org.apache.kafka.common.PartitionInfo;
 
 public class YourPartitioner implements Partitioner {
+  // Broker ID 到空間利用率的映射
+  private final Map<Integer, Long> brokerSpaceUsage = new ConcurrentHashMap<>();
 
-  private final Set<Integer> nodes = new HashSet<>();
-  private final PriorityQueue<BrokerUsage> brokerUsageQueue =
-      new PriorityQueue<>(Comparator.comparingLong(b -> b.usage));
-  private final Map<Integer, List<PartitionInfo>> brokerToPartitions = new HashMap<>();
-  private Iterator<Integer> roundRobinIterator; // 用於輪詢初始化
-
-  private long maxUsageThreshold = 2L * 1024 * 1024 * 1024; // 初始負載門檻，2 GB
+  // Partition 到 Broker ID 的映射
+  private final Map<Integer, Integer> partitionToBroker = new ConcurrentHashMap<>();
 
   @Override
   public void configure(Map<String, ?> configs) {}
 
   @Override
   public int partition(
-      String topic, Object key, byte[] keyBytes, Object value, byte[] valueBytes, Cluster cluster) {
+      String topic,
+      Object keyObj,
+      byte[] keyBytes,
+      Object valueObj,
+      byte[] valueBytes,
+      Cluster cluster) {
 
-    if (brokerUsageQueue.isEmpty() || nodes.size() != cluster.nodes().size()) {
-      initializeBrokerUsage(cluster);
-      assignPartitionsToBrokers(cluster.availablePartitionsForTopic(topic));
-      initializeRoundRobinIterator();
-    }
+    // 獲取 topic 的所有分區信息
+    List<PartitionInfo> partitions = cluster.partitionsForTopic(topic);
 
-    return selectPartitionForBroker(valueBytes);
-  }
-
-  private void initializeRoundRobinIterator() {
-    roundRobinIterator = nodes.iterator();
-  }
-
-  private void assignPartitionsToBrokers(List<PartitionInfo> partitions) {
-    brokerToPartitions.values().forEach(List::clear);
-
+    // 更新 partitionToBroker 映射
     for (PartitionInfo partitionInfo : partitions) {
-      int brokerId = getNextBrokerInRoundRobin();
-      brokerToPartitions.get(brokerId).add(partitionInfo);
+      int partition = partitionInfo.partition();
+      int brokerId = partitionInfo.leader().id();
+      partitionToBroker.put(partition, brokerId);
+
+      // 初始化 brokerSpaceUsage，如果還沒有該 broker 的記錄
+      brokerSpaceUsage.putIfAbsent(brokerId, 0L);
     }
-  }
 
-  private int getNextBrokerInRoundRobin() {
-    if (!roundRobinIterator.hasNext()) {
-      initializeRoundRobinIterator();
-    }
-    return roundRobinIterator.next();
-  }
+    // 計算消息的大小
+    long messageSize = valueBytes != null ? valueBytes.length : 0;
 
-  private int selectPartitionForBroker(byte[] valueBytes) {
-    PriorityQueue<BrokerUsage> usageQueueCopy = new PriorityQueue<>(brokerUsageQueue);
-    long dataSize = calculateDataSize(valueBytes);
+    // 找到空間利用率最低的 broker
+    int selectedBroker =
+        brokerSpaceUsage.entrySet().stream()
+            .min(Comparator.comparingLong(Map.Entry::getValue))
+            .get()
+            .getKey();
 
-    while (!usageQueueCopy.isEmpty()) {
-      BrokerUsage leastLoadedBroker = usageQueueCopy.poll();
-      int brokerId = leastLoadedBroker.brokerId;
-      List<PartitionInfo> assignedPartitions = brokerToPartitions.get(brokerId);
-
-      if (!assignedPartitions.isEmpty() && leastLoadedBroker.usage + dataSize < maxUsageThreshold) {
-        PartitionInfo selectedPartition = assignedPartitions.remove(0);
-        updateBrokerUsage(brokerId, dataSize);
-        return selectedPartition.partition();
+    // 在 selectedBroker 上找到可用的分區
+    List<Integer> candidatePartitions = new ArrayList<>();
+    for (Map.Entry<Integer, Integer> entry : partitionToBroker.entrySet()) {
+      if (entry.getValue() == selectedBroker) {
+        candidatePartitions.add(entry.getKey());
       }
     }
 
-    adjustThreshold(); // 動態調整門檻
-    return getFallbackPartition(); // 使用回退分區
-  }
-
-  private int getFallbackPartition() {
-    for (List<PartitionInfo> partitions : brokerToPartitions.values()) {
-      if (!partitions.isEmpty()) {
-        return partitions.get(0).partition();
-      }
+    // 如果沒有找到，則使用默認的輪詢方式
+    int selectedPartition;
+    if (candidatePartitions.isEmpty()) {
+      // 使用輪詢方式選擇分區
+      selectedPartition = Math.abs(Arrays.hashCode(keyBytes)) % partitions.size();
+    } else {
+      // 從候選分區中選擇一個
+      selectedPartition = candidatePartitions.get(new Random().nextInt(candidatePartitions.size()));
     }
-    return 0;
-  }
 
-  private void updateBrokerUsage(int brokerId, long dataSize) {
-    brokerUsageQueue.removeIf(b -> b.brokerId == brokerId);
-    brokerUsageQueue.add(new BrokerUsage(brokerId, dataSize));
-  }
+    // 更新選定 broker 的空間利用率
+    brokerSpaceUsage.compute(selectedBroker, (k, v) -> v + messageSize);
 
-  private void initializeBrokerUsage(Cluster cluster) {
-    brokerUsageQueue.clear();
-    nodes.clear();
-    brokerToPartitions.clear();
-    for (Node node : cluster.nodes()) {
-      brokerUsageQueue.add(new BrokerUsage(node.id(), 0L));
-      brokerToPartitions.put(node.id(), new ArrayList<>());
-      nodes.add(node.id());
-    }
-  }
-
-  private long calculateDataSize(byte[] data) {
-    return data == null ? 0L : data.length;
-  }
-
-  private void adjustThreshold() {
-    BrokerUsage maxLoadBroker = brokerUsageQueue.peek();
-    if (maxLoadBroker != null) {
-      if (maxLoadBroker.usage > maxUsageThreshold * 0.8) {
-        maxUsageThreshold += 256 * 1024 * 1024; // 增加 256 MB
-      } else if (maxLoadBroker.usage < maxUsageThreshold * 0.5) {
-        maxUsageThreshold =
-            Math.max(2L * 1024 * 1024 * 1024, maxUsageThreshold - 256 * 1024 * 1024); // 降低並設下限
-      }
-    }
-  }
-
-  private static class BrokerUsage {
-    int brokerId;
-    long usage;
-
-    BrokerUsage(int brokerId, long usage) {
-      this.brokerId = brokerId;
-      this.usage = usage;
-    }
+    return selectedPartition;
   }
 
   @Override
