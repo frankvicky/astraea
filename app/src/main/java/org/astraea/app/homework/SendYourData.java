@@ -21,7 +21,6 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
-import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -30,6 +29,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import java.util.stream.LongStream;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
@@ -67,13 +67,16 @@ public class SendYourData {
           Duration.ofSeconds(10),
           1);
     }
-    var keys =
-        List.of(
-            new Key(IntStream.range(0, 1000).mapToObj(Long::valueOf).toList()),
-            new Key(IntStream.range(0, 2000).mapToObj(Long::valueOf).toList()),
-            new Key(IntStream.range(0, 2500).mapToObj(Long::valueOf).toList()),
-            new Key(IntStream.range(0, 3000).mapToObj(Long::valueOf).toList()));
-    var max = Runtime.getRuntime().totalMemory();
+
+    // Use Array instead of List
+    Key[] keys = {
+      new Key(LongStream.range(0, 1000).toArray()),
+      new Key(LongStream.range(0, 2000).toArray()),
+      new Key(LongStream.range(0, 2500).toArray()),
+      new Key(LongStream.range(0, 3000).toArray())
+    };
+
+    long max = Runtime.getRuntime().totalMemory();
     try (var sender = new YourSender(param.bootstrapServers())) {
       var start = System.currentTimeMillis();
       var fs =
@@ -84,7 +87,9 @@ public class SendYourData {
                           () -> {
                             while (System.currentTimeMillis() - start
                                 <= param.duration.toMillis()) {
-                              keys.forEach(k -> sender.send(param.topics, k));
+                              for (Key k : keys) {
+                                sender.send(param.topics, k);
+                              }
                             }
                           }))
               .toList();
@@ -126,7 +131,34 @@ public class SendYourData {
     }
   }
 
-  public record Key(List<Long> vs) {}
+  public static class Key {
+    /** store the serialized result of value */
+    private final byte[] serialized;
+
+    public Key(long[] vs) {
+      this.serialized =
+          new byte[vs.length * Long.BYTES]; // initialize a byte array according to value length
+      for (int i = 0; i < vs.length; i++) {
+        long v = vs[i];
+        int offset = i * Long.BYTES;
+        serialized[offset] = (byte) (v >>> 56); // get first 8 bit and put into the byte array
+        serialized[offset + 1] = (byte) (v >>> 48); // get second 8 bit and put into the byte array
+        serialized[offset + 2] = (byte) (v >>> 40);
+        serialized[offset + 3] = (byte) (v >>> 32);
+        serialized[offset + 4] = (byte) (v >>> 24);
+        serialized[offset + 5] = (byte) (v >>> 16);
+        serialized[offset + 6] = (byte) (v >>> 8);
+        serialized[offset + 7] = (byte) v;
+      }
+    }
+
+    /**
+     * @return serialized result
+     */
+    public byte[] getSerialized() {
+      return serialized;
+    }
+  }
 
   public static class YourSender implements Closeable {
     private final KafkaProducer<Key, byte[]> producer;
@@ -137,15 +169,8 @@ public class SendYourData {
     }
 
     public YourSender(String bootstrapServers) {
-      Serializer<Key> serializer =
-          (topic, key) -> {
-            var buffer = ByteBuffer.allocate(Long.BYTES * key.vs.size());
-            key.vs.forEach(buffer::putLong);
-            buffer.flip();
-            var bytes = new byte[buffer.remaining()];
-            buffer.get(bytes);
-            return bytes;
-          };
+      // get the serialized result which has been pre-calculated
+      Serializer<Key> serializer = (topic, key) -> key.getSerialized();
       producer =
           new KafkaProducer<>(
               Map.of(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers),
@@ -153,8 +178,8 @@ public class SendYourData {
               new ByteArraySerializer());
     }
 
-    public void send(List<String> topic, Key key) {
-      topic.forEach(t -> producer.send(new ProducerRecord<>(t, key, null)));
+    public void send(List<String> topics, Key key) {
+      topics.forEach(t -> producer.send(new ProducerRecord<>(t, key, null)));
     }
   }
 
