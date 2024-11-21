@@ -173,7 +173,13 @@ public class SendYourData {
       Serializer<Key> serializer = (topic, key) -> key.getSerialized();
       producer =
           new KafkaProducer<>(
-              Map.of(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers),
+              Map.of(
+                  ProducerConfig.BOOTSTRAP_SERVERS_CONFIG,
+                  bootstrapServers,
+                  ProducerConfig.LINGER_MS_CONFIG,
+                  "1000",
+                  ProducerConfig.BATCH_SIZE_CONFIG,
+                  "131072"),
               serializer,
               new ByteArraySerializer());
     }
