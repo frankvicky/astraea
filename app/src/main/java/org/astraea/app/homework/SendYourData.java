@@ -176,10 +176,12 @@ public class SendYourData {
               Map.of(
                   ProducerConfig.BOOTSTRAP_SERVERS_CONFIG,
                   bootstrapServers,
-                  ProducerConfig.LINGER_MS_CONFIG,
-                  "1000",
+                  ProducerConfig.BUFFER_MEMORY_CONFIG,
+                  "16777216",
                   ProducerConfig.BATCH_SIZE_CONFIG,
-                  "131072"),
+                  "524288",
+                  ProducerConfig.LINGER_MS_CONFIG,
+                  "2000"),
               serializer,
               new ByteArraySerializer());
     }
